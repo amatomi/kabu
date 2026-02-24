@@ -4,6 +4,8 @@ import json
 import datetime
 import os
 import urllib3
+import re
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Yahoo Finance JP ranking URLs
@@ -21,16 +23,20 @@ URLS = {
 
 def fetch_ranking(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     all_data = []
     # Fetch up to 2 pages (50 items per page = 100 items)
     for page in range(1, 3):
-        paged_url = f"{url}?page={page}"
-        response = requests.get(paged_url, headers=headers, verify=False)
-        if response.status_code != 200:
-            print(f"Failed to fetch {paged_url}")
+        paged_url = f"{url}&page={page}" if "?" in url else f"{url}?page={page}"
+        try:
+            response = requests.get(paged_url, headers=headers, verify=False, timeout=10)
+            if response.status_code != 200:
+                print(f"Failed to fetch {paged_url}: Status {response.status_code}")
+                break
+        except Exception as e:
+            print(f"Error fetching {paged_url}: {e}")
             break
             
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -47,11 +53,7 @@ def fetch_ranking(url):
             tds = row.find_all('td')
             if len(tds) < 3: continue
             
-            # Column 1 (tds[0] or tds[1] depending on if th is a td)
-            # Based on subagent, th is a separate element, and tds starts after th.
-            # But BeautifulSoup find_all('td') might include th if it's a td.
-            # In Yahoo Finance, rank is a <th>.
-            
+            # --- Name and Code ---
             name_cell = tds[0]
             name_a = name_cell.find('a')
             name = name_a.text.strip() if name_a else name_cell.text.strip().split('\n')[0]
@@ -59,35 +61,56 @@ def fetch_ranking(url):
             code_li = name_cell.find('li')
             code = code_li.text.strip() if code_li else ""
             if not code:
-                import re
                 code_match = re.search(r'\d{4}', name_cell.text)
                 code = code_match.group(0) if code_match else ""
 
-            # More precise price extraction
-            price_span = tds[1].find('span')
-            price = price_span.text.strip().replace(',', '') if price_span else tds[1].text.strip().split('\n')[0].replace(',', '')
-            
-            # More precise change_pct extraction
-            spans = tds[2].find_all('span')
-            if len(spans) >= 2:
-                # Usually it's in the last span or the one with %
-                change_pct = "-"
-                for s in spans:
-                    if '%' in s.text:
-                        change_pct = s.text.strip()
-                        break
+            # --- Price ---
+            price_td = tds[1]
+            # Price is usually in the first span that doesn't have a date-related class
+            price_spans = price_td.find_all('span', recursive=False)
+            if price_spans:
+                price = price_spans[0].text.strip().replace(',', '')
             else:
-                change_pct = tds[2].text.strip().replace('\n', ' ').split(' ')[-1]
+                price = price_td.text.strip().split('\n')[0].replace(',', '')
             
-            # Volume/Trading Value
-            volume_span = tds[3].find('span')
-            volume = volume_span.text.strip().replace(',', '').replace('株', '') if volume_span else tds[3].text.strip().replace(',', '').replace('株', '')
+            # --- Change and Change % ---
+            change_td = tds[2]
+            change_width = "-"
+            change_pct = "-"
+            
+            # The change cell has a nested structure. We want the two deepest spans.
+            # Example: <span><span>+50</span><span>+35.71%</span></span>
+            all_spans = change_td.find_all('span')
+            # Filter for spans that don't have other spans inside (leaf spans)
+            leaf_spans = [s for s in all_spans if not s.find('span')]
+            
+            if len(leaf_spans) >= 2:
+                # Usually first is absolute change (width), second is percentage
+                change_width = leaf_spans[0].text.strip().replace(',', '')
+                change_pct = leaf_spans[1].text.strip()
+                if not change_pct.endswith('%'):
+                    change_pct += '%'
+            elif len(leaf_spans) == 1:
+                text = leaf_spans[0].text.strip()
+                if '%' in text:
+                    change_pct = text
+                else:
+                    change_width = text.replace(',', '')
+
+            # --- Volume ---
+            volume_td = tds[3] if len(tds) > 3 else None
+            volume = "-"
+            if volume_td:
+                vol_span = volume_td.find('span')
+                volume = vol_span.text.strip() if vol_span else volume_td.text.strip()
+                volume = volume.replace(',', '').replace('株', '').replace('円', '')
             
             data = {
                 "rank": rank,
                 "code": code,
                 "name": name,
                 "price": price,
+                "change_width": change_width,
                 "change_pct": change_pct,
                 "volume": volume,
                 "per": "-",
@@ -104,6 +127,54 @@ def main():
         print(f"Fetching {theme}...")
         results[theme] = fetch_ranking(url)
         
+    # Standardize output for data.json
+    # Derive "値上がり幅" and "値下がり幅" if possible
+    if "値上がり率" in results:
+        # Sort by absolute change value (descending)
+        def sort_key(x):
+            try:
+                # Remove '+' and parse as float
+                val_str = x['change_width'].replace('+', '').replace(',', '')
+                return float(val_str)
+            except:
+                return -1.0
+        
+        sorted_width = sorted(results["値上がり率"], key=sort_key, reverse=True)
+        width_data = []
+        for i, item in enumerate(sorted_width[:100]):
+            new_item = item.copy()
+            new_item['rank'] = str(i + 1)
+            width_data.append(new_item)
+        results["値上がり幅"] = width_data
+
+    if "値下がり率" in results:
+        def sort_key_down(x):
+            try:
+                # Remove '-' and parse as float for relative magnitude
+                # Or keep '-' to sort most negative at the top of "price drop width"
+                val_str = x['change_width'].replace('-', '').replace(',', '')
+                return float(val_str)
+            except:
+                return -1.0
+        
+        sorted_width_down = sorted(results["値下がり率"], key=sort_key_down, reverse=True)
+        width_data_down = []
+        for i, item in enumerate(sorted_width_down[:100]):
+            new_item = item.copy()
+            new_item['rank'] = str(i + 1)
+            width_data_down.append(new_item)
+        results["値下がり幅"] = width_data_down
+
+    # Ensure all keys exist
+    expected_keys = [
+        "値上がり率", "値下がり率", "出来高", "売買代金", 
+        "値上がり幅", "値下がり幅", "配当利回り", 
+        "高PER", "低PER", "高PBR", "低PBR"
+    ]
+    for key in expected_keys:
+        if key not in results:
+            results[key] = []
+            
     retrieval_time = datetime.datetime.now().strftime("%Y/%m/%d %H:%M")
     
     output = {
