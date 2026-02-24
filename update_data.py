@@ -3,20 +3,20 @@ from bs4 import BeautifulSoup
 import json
 import datetime
 import os
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Yahoo Finance JP ranking URLs
 URLS = {
     "値上がり率": "https://finance.yahoo.co.jp/stocks/ranking/up",
     "値下がり率": "https://finance.yahoo.co.jp/stocks/ranking/down",
     "出来高": "https://finance.yahoo.co.jp/stocks/ranking/volume",
-    "売買代金": "https://finance.yahoo.co.jp/stocks/ranking/tradingValue",
-    "値上がり幅": "https://finance.yahoo.co.jp/stocks/ranking/upWidth",
-    "値下がり幅": "https://finance.yahoo.co.jp/stocks/ranking/downWidth",
-    "配当利回り": "https://finance.yahoo.co.jp/stocks/ranking/yield",
-    "高PER": "https://finance.yahoo.co.jp/stocks/ranking/perHigh",
-    "低PER": "https://finance.yahoo.co.jp/stocks/ranking/perLow",
-    "高PBR": "https://finance.yahoo.co.jp/stocks/ranking/pbrHigh",
-    "低PBR": "https://finance.yahoo.co.jp/stocks/ranking/pbrLow"
+    "売買代金": "https://finance.yahoo.co.jp/stocks/ranking/tradingValueHigh",
+    "配当利回り": "https://finance.yahoo.co.jp/stocks/ranking/dividendYield",
+    "高PER": "https://finance.yahoo.co.jp/stocks/ranking/highPer?market=all&term=daily",
+    "低PER": "https://finance.yahoo.co.jp/stocks/ranking/lowPer?market=all&term=daily",
+    "高PBR": "https://finance.yahoo.co.jp/stocks/ranking/highPbr?market=all&term=daily",
+    "低PBR": "https://finance.yahoo.co.jp/stocks/ranking/lowPbr?market=all&term=daily"
 }
 
 def fetch_ranking(url):
@@ -28,7 +28,7 @@ def fetch_ranking(url):
     # Fetch up to 2 pages (50 items per page = 100 items)
     for page in range(1, 3):
         paged_url = f"{url}?page={page}"
-        response = requests.get(paged_url, headers=headers)
+        response = requests.get(paged_url, headers=headers, verify=False)
         if response.status_code != 200:
             print(f"Failed to fetch {paged_url}")
             break
@@ -40,21 +40,59 @@ def fetch_ranking(url):
             
         rows = table.find_all('tr')[1:] # Skip header
         for row in rows:
-            cols = row.find_all('td')
-            if len(cols) < 5:
-                continue
-                
-            # Basic mapping (may need adjustment based on specific ranking page structure)
+            th = row.find(['th', 'td'])
+            if not th: continue
+            rank = th.text.strip()
+            
+            tds = row.find_all('td')
+            if len(tds) < 3: continue
+            
+            # Column 1 (tds[0] or tds[1] depending on if th is a td)
+            # Based on subagent, th is a separate element, and tds starts after th.
+            # But BeautifulSoup find_all('td') might include th if it's a td.
+            # In Yahoo Finance, rank is a <th>.
+            
+            name_cell = tds[0]
+            name_a = name_cell.find('a')
+            name = name_a.text.strip() if name_a else name_cell.text.strip().split('\n')[0]
+            
+            code_li = name_cell.find('li')
+            code = code_li.text.strip() if code_li else ""
+            if not code:
+                import re
+                code_match = re.search(r'\d{4}', name_cell.text)
+                code = code_match.group(0) if code_match else ""
+
+            # More precise price extraction
+            price_span = tds[1].find('span')
+            price = price_span.text.strip().replace(',', '') if price_span else tds[1].text.strip().split('\n')[0].replace(',', '')
+            
+            # More precise change_pct extraction
+            spans = tds[2].find_all('span')
+            if len(spans) >= 2:
+                # Usually it's in the last span or the one with %
+                change_pct = "-"
+                for s in spans:
+                    if '%' in s.text:
+                        change_pct = s.text.strip()
+                        break
+            else:
+                change_pct = tds[2].text.strip().replace('\n', ' ').split(' ')[-1]
+            
+            # Volume/Trading Value
+            volume_span = tds[3].find('span')
+            volume = volume_span.text.strip().replace(',', '').replace('株', '') if volume_span else tds[3].text.strip().replace(',', '').replace('株', '')
+            
             data = {
-                "rank": cols[0].text.strip(),
-                "code": cols[1].text.strip(),
-                "name": cols[3].text.strip(),
-                "price": cols[5].text.strip(),
-                "change_pct": cols[6].text.strip() if len(cols) > 6 else "-",
-                "volume": cols[7].text.strip() if len(cols) > 7 else "-",
-                "per": cols[8].text.strip() if len(cols) > 8 else "-",
-                "pbr": cols[9].text.strip() if len(cols) > 9 else "-",
-                "yield": cols[10].text.strip() if len(cols) > 10 else "-"
+                "rank": rank,
+                "code": code,
+                "name": name,
+                "price": price,
+                "change_pct": change_pct,
+                "volume": volume,
+                "per": "-",
+                "pbr": "-",
+                "yield": "-"
             }
             all_data.append(data)
             
@@ -77,7 +115,11 @@ def main():
     with open('data.js', 'w', encoding='utf-8') as f:
         f.write(f"const STOCK_DATA = {json.dumps(output, ensure_ascii=False, indent=4)};")
         
-    print("Successfully updated data.js")
+    # Write as JSON file
+    with open('data.json', 'w', encoding='utf-8') as f:
+        json.dump(output['rankings'], f, ensure_ascii=False, indent=2)
+        
+    print("Successfully updated data.js and data.json")
 
 if __name__ == "__main__":
     main()
