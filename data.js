@@ -1,5 +1,5 @@
 const STOCK_DATA = {
-    "retrieval_time": "2026/07/17 09:27",
+    "retrieval_time": "2026/07/20 10:25",
     "rankings": {
         "値上がり率": [
             {
